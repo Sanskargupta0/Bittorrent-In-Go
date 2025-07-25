@@ -119,6 +119,13 @@ func decodeList(b string, st int) (l []interface{}, i int, err error) {
 }
 
 func decodeDict(b string, st int) (d map[string]interface{}, i int, err error) {
+	if st == len(b) {
+		return nil, st, io.ErrUnexpectedEOF
+	}
+	if b[st] != 'd' {
+		return nil, st, fmt.Errorf("dict expected")
+	}
+
 	i = st
 	i++ // 'd'
 
@@ -161,7 +168,8 @@ func decodeDict(b string, st int) (d map[string]interface{}, i int, err error) {
 func main() {
 	command := os.Args[1]
 
-	if command == "decode" {
+	switch command {
+	case "decode":
 		x, _, err := decode(os.Args[2], 0)
 		if err != nil {
 			fmt.Printf("error: %v\n", err)
@@ -175,7 +183,29 @@ func main() {
 		}
 
 		fmt.Printf("%s\n", y)
-	} else {
+	case "info":
+		data, err := os.ReadFile(os.Args[2])
+		if err != nil {
+			fmt.Printf("error: read file: %v\n", err)
+			os.Exit(1)
+		}
+
+		d, _, err := decodeDict(string(data), 0)
+		if err != nil {
+			fmt.Printf("error: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Tracker URL: %v\n", d["announce"])
+
+		info, ok := d["info"].(map[string]interface{})
+		if info == nil || !ok {
+			fmt.Printf("No info section\n")
+			return
+		}
+
+		fmt.Printf("Length: %v\n", info["length"])
+	default:
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
 	}
