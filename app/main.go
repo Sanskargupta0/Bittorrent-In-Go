@@ -20,6 +20,8 @@ func decode(b string, st int) (x interface{}, i int, err error) {
 	switch {
 	case b[i] == 'l':
 		return decodeList(b, i)
+	case b[i] == 'd':
+		return decodeDict(b, i)
 	case b[i] == 'i':
 		return decodeInt(b, i)
 	case b[i] >= '0' && b[i] <= '9':
@@ -114,6 +116,46 @@ func decodeList(b string, st int) (l []interface{}, i int, err error) {
 	}
 
 	return l, i, nil
+}
+
+func decodeDict(b string, st int) (d map[string]interface{}, i int, err error) {
+	i = st
+	i++ // 'd'
+
+	d = make(map[string]interface{})
+
+	for {
+		if i >= len(b) {
+			return nil, st, fmt.Errorf("bad list")
+		}
+
+		if b[i] == 'e' {
+			break
+		}
+
+		pairst := i
+
+		var key, val interface{}
+
+		key, i, err = decode(b, i)
+		if err != nil {
+			return nil, i, err
+		}
+
+		keys, ok := key.(string)
+		if !ok {
+			return nil, pairst, fmt.Errorf("dict key is not a string: %q", key)
+		}
+
+		val, i, err = decode(b, i)
+		if err != nil {
+			return nil, i, err
+		}
+
+		d[keys] = val
+	}
+
+	return d, i, nil
 }
 
 func main() {
