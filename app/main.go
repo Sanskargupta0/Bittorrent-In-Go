@@ -15,10 +15,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/codecrafters-io/bittorrent-starter-go/cmd/mybittorrent/bencode"
-	"github.com/codecrafters-io/bittorrent-starter-go/cmd/mybittorrent/magnet"
-	"github.com/codecrafters-io/bittorrent-starter-go/cmd/mybittorrent/utils"
-
+	"github.com/codecrafters-io/bittorrent-starter-go/app/bencode"
+	"github.com/codecrafters-io/bittorrent-starter-go/app/magnet"
+	"github.com/codecrafters-io/bittorrent-starter-go/app/utils"
 	netUrl "net/url"
 )
 
