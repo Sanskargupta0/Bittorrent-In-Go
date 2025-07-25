@@ -15,10 +15,11 @@ import (
 	"strings"
 	"sync"
 
+	netUrl "net/url"
+
 	"github.com/codecrafters-io/bittorrent-starter-go/app/bencode"
 	"github.com/codecrafters-io/bittorrent-starter-go/app/magnet"
 	"github.com/codecrafters-io/bittorrent-starter-go/app/utils"
-	netUrl "net/url"
 )
 
 // Ensures gofmt doesn't remove the "os" encoding/json import (feel free to remove this!)

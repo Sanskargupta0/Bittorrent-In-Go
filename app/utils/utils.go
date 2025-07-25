@@ -1,9 +1,9 @@
 package utils
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
-	"encoding/binary"
 )
 
 // GetPeerId returns a fixed peer ID for this client
@@ -16,14 +16,14 @@ func DecodePeers(data []byte) ([]string, error) {
 	if len(data)%6 != 0 {
 		return nil, fmt.Errorf("invalid peers data length")
 	}
-	
+
 	var peers []string
 	for i := 0; i < len(data); i += 6 {
 		ip := fmt.Sprintf("%d.%d.%d.%d", data[i], data[i+1], data[i+2], data[i+3])
-		port := binary.BigEndian.Uint16(data[i+4:i+6])
+		port := binary.BigEndian.Uint16(data[i+4 : i+6])
 		peers = append(peers, fmt.Sprintf("%s:%d", ip, port))
 	}
-	
+
 	return peers, nil
 }
 

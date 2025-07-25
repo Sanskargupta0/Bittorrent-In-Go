@@ -40,13 +40,13 @@ func decodeInteger(bencodedString string, index int) (interface{}, int, error) {
 		return nil, index, fmt.Errorf("invalid integer format")
 	}
 	endIndex += index
-	
+
 	intStr := bencodedString[index:endIndex]
 	num, err := strconv.Atoi(intStr)
 	if err != nil {
 		return nil, index, fmt.Errorf("invalid integer: %s", intStr)
 	}
-	
+
 	return num, endIndex + 1, nil
 }
 
@@ -56,27 +56,27 @@ func decodeString(bencodedString string, index int) (interface{}, int, error) {
 		return nil, index, fmt.Errorf("invalid string format")
 	}
 	colonIndex += index
-	
+
 	lengthStr := bencodedString[index:colonIndex]
 	length, err := strconv.Atoi(lengthStr)
 	if err != nil {
 		return nil, index, fmt.Errorf("invalid string length: %s", lengthStr)
 	}
-	
+
 	startIndex := colonIndex + 1
 	endIndex := startIndex + length
 	if endIndex > len(bencodedString) {
 		return nil, index, fmt.Errorf("string length exceeds data")
 	}
-	
+
 	return bencodedString[startIndex:endIndex], endIndex, nil
 }
 
 func decodeList(bencodedString string, index int) (interface{}, int, error) {
 	// Skip 'l'
 	index++
-	var list []interface{}
-	
+	list := make([]interface{}, 0) // Initialize empty slice instead of nil slice
+
 	for index < len(bencodedString) && bencodedString[index] != 'e' {
 		element, newIndex, err := DecodeBencode(bencodedString, index)
 		if err != nil {
@@ -85,11 +85,11 @@ func decodeList(bencodedString string, index int) (interface{}, int, error) {
 		list = append(list, element)
 		index = newIndex
 	}
-	
+
 	if index >= len(bencodedString) {
 		return nil, index, fmt.Errorf("unterminated list")
 	}
-	
+
 	// Skip 'e'
 	return list, index + 1, nil
 }
@@ -98,7 +98,7 @@ func decodeDictionary(bencodedString string, index int) (interface{}, int, error
 	// Skip 'd'
 	index++
 	dict := make(map[string]interface{})
-	
+
 	for index < len(bencodedString) && bencodedString[index] != 'e' {
 		// Decode key (must be string)
 		key, newIndex, err := DecodeBencode(bencodedString, index)
@@ -110,7 +110,7 @@ func decodeDictionary(bencodedString string, index int) (interface{}, int, error
 			return nil, index, fmt.Errorf("dictionary key must be string")
 		}
 		index = newIndex
-		
+
 		// Decode value
 		value, newIndex, err := DecodeBencode(bencodedString, index)
 		if err != nil {
@@ -119,11 +119,11 @@ func decodeDictionary(bencodedString string, index int) (interface{}, int, error
 		dict[keyStr] = value
 		index = newIndex
 	}
-	
+
 	if index >= len(bencodedString) {
 		return nil, index, fmt.Errorf("unterminated dictionary")
 	}
-	
+
 	// Skip 'e'
 	return dict, index + 1, nil
 }
@@ -134,12 +134,12 @@ func DecodeBencodeToString(bencodedString string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	jsonBytes, err := json.Marshal(decoded)
 	if err != nil {
 		return "", err
 	}
-	
+
 	return string(jsonBytes), nil
 }
 
@@ -155,20 +155,20 @@ func ConvToString(value interface{}) string {
 func DictToBencode(dict map[string]interface{}) (string, error) {
 	var result strings.Builder
 	result.WriteString("d")
-	
+
 	// Sort keys for deterministic output
 	keys := make([]string, 0, len(dict))
 	for key := range dict {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	
+
 	for _, key := range keys {
 		value := dict[key]
-		
+
 		// Encode key
 		result.WriteString(fmt.Sprintf("%d:%s", len(key), key))
-		
+
 		// Encode value
 		encoded, err := encodeToBencode(value)
 		if err != nil {
@@ -176,7 +176,7 @@ func DictToBencode(dict map[string]interface{}) (string, error) {
 		}
 		result.WriteString(encoded)
 	}
-	
+
 	result.WriteString("e")
 	return result.String(), nil
 }

@@ -4,13 +4,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"io"
-	"log"
-	
+
 	netUrl "net/url"
 )
 
@@ -30,11 +30,11 @@ func ParseMagnetLink(magnetLink string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse magnet link: %v", err)
 	}
-	
+
 	if parsedUrl.Scheme != "magnet" {
 		return nil, fmt.Errorf("not a magnet link")
 	}
-	
+
 	return parsedUrl, nil
 }
 
@@ -45,11 +45,11 @@ func GetInfoHash(parsedUrl *url.URL) (string, error) {
 	if xt == "" {
 		return "", fmt.Errorf("no xt parameter found")
 	}
-	
+
 	if !strings.HasPrefix(xt, "urn:btih:") {
 		return "", fmt.Errorf("invalid xt parameter format")
 	}
-	
+
 	infoHash := strings.TrimPrefix(xt, "urn:btih:")
 	return strings.ToLower(infoHash), nil
 }
@@ -61,7 +61,7 @@ func GetTrackerUrl(parsedUrl *url.URL) (string, error) {
 	if len(trackers) == 0 {
 		return "", fmt.Errorf("no tracker found")
 	}
-	
+
 	return trackers[0], nil
 }
 
@@ -83,12 +83,12 @@ func DiscoverPeers(trackerUrl string, infoHash string) ([]string, error) {
 		return nil, fmt.Errorf("peer discovery error: %v", err)
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %v", err)
 	}
-	
+
 	// This would need bencode decoding logic
 	// For now, return a placeholder based on body length
 	_ = body // Use body to avoid unused variable error
@@ -103,7 +103,7 @@ func GetHandshakeBytesForMagnet(infoHash []byte) ([]byte, error) {
 
 	// Write protocol string
 	data = append(data, []byte("BitTorrent protocol")...)
-	
+
 	// Reserved bytes - set extension bit for magnet
 	reserved := make([]byte, 8)
 	reserved[5] = 16 // Set extension bit
@@ -125,41 +125,41 @@ func GetHandshakeBytesForMagnet(infoHash []byte) ([]byte, error) {
 func GetHandshakeBytesForMagnetExtension2() ([]byte, error) {
 	// Extension handshake message
 	payload := "d1:md11:ut_metadatai1ee"
-	
+
 	data := make([]byte, 0)
 	// Message length (1 byte for message type + payload length)
 	messageLength := uint32(1 + len(payload))
 	data = binary.BigEndian.AppendUint32(data, messageLength)
-	
+
 	// Message type (20 for extension)
 	data = append(data, byte(20))
-	
+
 	// Extension message ID (0 for handshake)
 	data = append(data, byte(0))
-	
+
 	// Payload
 	data = append(data, []byte(payload)...)
-	
+
 	return data, nil
 }
 
 // SendExtensionMessage sends an extension message to a peer
 func SendExtensionMessage(conn net.Conn, extensionId int, payload []byte) {
 	data := make([]byte, 0)
-	
+
 	// Message length (1 byte for message type + 1 byte for extension ID + payload length)
 	messageLength := uint32(1 + 1 + len(payload))
 	data = binary.BigEndian.AppendUint32(data, messageLength)
-	
+
 	// Message type (20 for extension)
 	data = append(data, byte(20))
-	
+
 	// Extension message ID
 	data = append(data, byte(extensionId))
-	
+
 	// Payload
 	data = append(data, payload...)
-	
+
 	// Send message
 	_, err := conn.Write(data)
 	if err != nil {
