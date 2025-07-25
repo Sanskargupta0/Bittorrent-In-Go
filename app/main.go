@@ -1,995 +1,634 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
-	netUrl "net/url"
-
-	"github.com/codecrafters-io/bittorrent-starter-go/app/bencode"
-	"github.com/codecrafters-io/bittorrent-starter-go/app/magnet"
-	"github.com/codecrafters-io/bittorrent-starter-go/app/utils"
+	"github.com/dchest/uniuri"
+	bencode "github.com/jackpal/bencode-go"
 )
+
+var BLOCK_SIZE = 16384
+
+type Info struct {
+	length      int
+	pieceLength int
+	pieces      [][20]byte
+	infoHash    [20]byte
+}
+
+type ExtensionMetadata struct {
+	length      int
+	pieceLength int
+	pieces      [][20]byte
+	name        string
+}
+
+type TorrentFile struct {
+	announce string
+	info     Info
+}
+
+type PeerResponse struct {
+	length  int
+	id      int
+	payload []byte
+}
+
+type PieceResponse struct {
+	index int
+	begin int
+	data  []byte
+}
+
+type MagnetLink struct {
+	trackerUrl  string
+	infoHashHex string
+	infoHash    [20]byte
+}
 
 // Ensures gofmt doesn't remove the "os" encoding/json import (feel free to remove this!)
 var _ = json.Marshal
 
-const BITFIELD = 5
-const INTERESTED = 2
-const UNCHOKE = 1
-const REQUEST = 6
-const PIECE = 7
-const BLOCK_LENGTH = 16 * 1024
+func decodeString(bencodedString string) (string, string, error) {
+	var firstColonIndex int
 
-var pieces_map map[int][]byte
-var pieces_lock sync.Mutex
-
-func WaitForSpecificExtensionMsg(conn net.Conn, msgId uint8) ([]byte, error) {
-	for {
-		rcvdMsgId, payload, err := GetExtensionReqMessaage(conn)
-		//fmt.Println("received msg with id: " + strconv.Itoa(int(rcvdMsgId)))
-		if err != nil {
-			return nil, err
-		}
-		if rcvdMsgId == msgId {
-			return payload, nil
+	for i := 0; i < len(bencodedString); i++ {
+		if bencodedString[i] == ':' {
+			firstColonIndex = i
+			break
 		}
 	}
+
+	lengthStr := bencodedString[:firstColonIndex]
+
+	length, err := strconv.Atoi(lengthStr)
+	if err != nil {
+		return "", "", err
+	}
+
+	rest := bencodedString[firstColonIndex+length+1:]
+	return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], rest, nil
 }
 
-func WaitForSpecificPeerMessage(conn net.Conn, msgId uint8) ([]byte, error) {
-	for {
-		rcvdMsgId, payload, err := GetPeerMessage(conn)
-		//fmt.Println("received msg with id: " + strconv.Itoa(int(rcvdMsgId)))
-		if err != nil {
-			return nil, err
-		}
-		if rcvdMsgId == msgId {
-			return payload, nil
-		}
+func decodeInt(bencodedString string) (int, string, error) {
+	endIdx := 1
+	for bencodedString[endIdx] != 'e' {
+		endIdx++
+	}
+	res, nil := strconv.Atoi(bencodedString[1:endIdx])
+	rest := bencodedString[endIdx+1:]
+	return res, rest, nil
+}
+
+func decodeList(bencodedString string) ([]interface{}, string, error) {
+	list := make([]interface{}, 0)
+
+	bencodedString = bencodedString[1:]
+	for bencodedString[0] != 'e' {
+		res, rest, _ := decodeBencode(bencodedString)
+		bencodedString = rest
+		list = append(list, res)
+	}
+
+	return list, bencodedString[1:], nil
+}
+
+func decodeDict(bencodedString string) (map[string]interface{}, string, error) {
+	dict := make(map[string]interface{})
+
+	bencodedString = bencodedString[1:]
+	for bencodedString[0] != 'e' {
+		key, rest1, _ := decodeString(bencodedString)
+		value, rest2, _ := decodeBencode(rest1)
+
+		bencodedString = rest2
+		dict[string(key)] = value
+	}
+
+	return dict, bencodedString[1:], nil
+}
+
+func decodeBencode(bencodedString string) (interface{}, string, error) {
+	// string decoding
+	if unicode.IsDigit(rune(bencodedString[0])) {
+		return decodeString(bencodedString)
+	}
+
+	// integer decoding
+	if bencodedString[0] == 'i' {
+		return decodeInt(bencodedString)
+	}
+
+	// list decoding
+	if bencodedString[0] == 'l' {
+		return decodeList(bencodedString)
+	}
+
+	// dict decoding
+	if bencodedString[0] == 'd' {
+		return decodeDict(bencodedString)
+	}
+
+	return "", "", fmt.Errorf("only strings and integers are supported at the moment")
+}
+
+func formatPiecesString(piecesStr string) [][20]byte {
+	piecesBytes := []byte(piecesStr)
+
+	pieces := make([][20]byte, 0)
+	for i := 20; i <= len(piecesBytes); i += 20 {
+		var chunk [20]byte
+		copy(chunk[:], piecesBytes[i-20:i])
+		pieces = append(pieces, chunk)
+	}
+
+	return pieces
+}
+
+func decodeTorrentFile(fileName string) TorrentFile {
+	data, _ := os.ReadFile(fileName)
+
+	decoded, _, _ := decodeDict(string(data))
+	announce := decoded["announce"].(string)
+
+	info := decoded["info"].(map[string]interface{})
+
+	length := info["length"].(int)
+	pieceLength := info["piece length"].(int)
+
+	var buffer bytes.Buffer
+	bencode.Marshal(io.Writer(&buffer), info)
+
+	pieces := formatPiecesString(info["pieces"].(string))
+
+	return TorrentFile{
+		announce: announce,
+		info: Info{
+			length:      length,
+			pieceLength: pieceLength,
+			pieces:      pieces,
+			infoHash:    sha1.Sum(buffer.Bytes()),
+		},
 	}
 }
 
-func SendRequestMsg(conn net.Conn, index uint32, begin uint32, length uint32) {
-	payload := make([]byte, 0)
-	payload = binary.BigEndian.AppendUint32(payload, index)
-	payload = binary.BigEndian.AppendUint32(payload, begin)
-	payload = binary.BigEndian.AppendUint32(payload, length)
+func resolvePeers(torrentFile *TorrentFile) []string {
+	query := torrentFile.announce
+	query += "?info_hash=" + url.QueryEscape(string(torrentFile.info.infoHash[:]))
+	query += "&peer_id=" + uniuri.NewLen(20)
+	query += "&port=6881"
+	query += "&uploaded=0"
+	query += "&downloaded=0"
+	query += fmt.Sprintf("&left=%d", torrentFile.info.length)
+	query += "&compact=1"
 
-	SendPeerMessage(conn, REQUEST, payload)
-}
-
-func SendPeerMessage(conn net.Conn, msgId uint8, payload []byte) {
-	data := make([]byte, 0)
-	// append msg length
-	messageLengthBytes := make([]byte, 0)
-	messageLengthBytes = binary.BigEndian.AppendUint32(messageLengthBytes, uint32(len(payload)+1))
-	data = append(data, messageLengthBytes...)
-
-	// append msgId
-	data = append(data, byte(msgId))
-
-	// append payload
-	data = append(data, payload...)
-
-	// send msg
-	//fmt.Println("sending peer msg with msgId: " + strconv.Itoa(int(msgId)))
-	conn.Write(data)
-}
-
-func getPieceLength(index int, pieceLength int, totalLength int) int {
-	if (pieceLength * (index + 1)) < totalLength {
-		return pieceLength
-	}
-	return totalLength - (pieceLength * index)
-}
-func GetPeerMessage(conn net.Conn) (uint8, []byte, error) {
-	messageLengthBytes := make([]byte, 4)
-	messageIdBytes := make([]byte, 1)
-	//fmt.Println("starting reading peer msg")
-
-	_, err := conn.Read(messageLengthBytes)
+	resp, err := http.Get(query)
 	if err != nil {
-		log.Fatalf("%s error reading msg length", err.Error())
-		return 0, nil, err
+		fmt.Println("fetch error")
+		return make([]string, 0)
 	}
 
-	messageLength := binary.BigEndian.Uint32(messageLengthBytes)
-	//log.Println("retrieved msg with msglength: " + strconv.Itoa(int(messageLength)))
-
-	_, err = conn.Read(messageIdBytes)
-	if err != nil {
-		log.Fatalf("%s error reading msg id", err.Error())
-		return 0, nil, err
-	}
-
-	//log.Println("retrieved msg with id: " + strconv.Itoa(int(messageIdBytes[0])))
-
-	payload := make([]byte, messageLength-1)
-
-	_, err = io.ReadFull(conn, payload)
-
-	if err != nil {
-		log.Fatalf("%s error payload", err.Error())
-		return 0, nil, err
-	}
-
-	return uint8(messageIdBytes[0]), payload, nil
-}
-
-func GetExtensionReqMessaage(conn net.Conn) (uint8, []byte, error) {
-	messageLengthBytes := make([]byte, 4)
-	messageIdBytes := make([]byte, 1)
-	//fmt.Println("starting reading peer msg")
-
-	_, err := conn.Read(messageLengthBytes)
-	if err != nil {
-		log.Fatalf("%s error reading msg length", err.Error())
-		return 0, nil, err
-	}
-
-	messageLength := binary.BigEndian.Uint32(messageLengthBytes)
-	//log.Println("retrieved msg with msglength: " + strconv.Itoa(int(messageLength)))
-
-	_, err = conn.Read(messageIdBytes)
-	if err != nil {
-		log.Fatalf("%s error reading msg id", err.Error())
-		return 0, nil, err
-	}
-
-	//log.Println("retrieved msg with id: " + strconv.Itoa(int(messageIdBytes[0])))
-
-	payload := make([]byte, messageLength-1)
-
-	_, err = io.ReadFull(conn, payload)
-
-	if err != nil {
-		log.Fatalf("%s error payload", err.Error())
-		return 0, nil, err
-	}
-
-	return uint8(messageIdBytes[0]), payload, nil
-}
-
-func DiscoverPeers(trackerUrl string, infoHash string, length int) ([]string, error) {
-	infoBtes, _ := hex.DecodeString(infoHash)
-	var urlBuilder strings.Builder
-	urlBuilder.WriteString(trackerUrl)
-	urlBuilder.WriteString("?info_hash=" + netUrl.QueryEscape(string(infoBtes)))
-	urlBuilder.WriteString("&peer_id=" + utils.GetPeerId())
-	urlBuilder.WriteString("&port=6881")
-	urlBuilder.WriteString("&uploaded=0")
-	urlBuilder.WriteString("&downloaded=0")
-	urlBuilder.WriteString(fmt.Sprintf("&left=%s", strconv.Itoa(length)))
-	urlBuilder.WriteString("&compact=1")
-
-	resp, err := http.Get(urlBuilder.String())
-	if err != nil {
-		log.Fatalf("peer error %s", err.Error())
-		return nil, err
-	}
 	defer resp.Body.Close()
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("error reading body of get %s", err.Error())
-		return nil, fmt.Errorf("error reading body of get")
-	}
-	decodedMap, _, err := bencode.DecodeBencode(string(body), 0)
-	if err != nil {
-		log.Fatalf("error decoding %s", err.Error())
-		return nil, err
-	}
-	m := decodedMap.(map[string]interface{})
-	peers, _ := utils.DecodePeers([]byte(bencode.ConvToString(m["peers"])))
+	body, _ := io.ReadAll(resp.Body)
 
-	return peers, nil
+	decodedResp, _, _ := decodeDict(string(body))
+	peerBytes := []byte(decodedResp["peers"].(string))
+
+	peers := make([]string, 0)
+	for i := 6; i <= len(peerBytes); i += 6 {
+		peer := fmt.Sprintf("%d.%d.%d.%d:%d",
+			int(peerBytes[i-6]),
+			int(peerBytes[i-5]),
+			int(peerBytes[i-4]),
+			int(peerBytes[i-3]),
+			binary.BigEndian.Uint16(peerBytes[i-2:i]))
+		peers = append(peers, peer)
+	}
+
+	return peers
 }
 
-func GetHandshakeBytes(infoHash []byte) ([]byte, error) {
-	data := make([]byte, 0)
-	// Write length
-	data = append(data, byte(19))
+func performHandshake(conn net.Conn, infoHash [20]byte) []byte {
+	peerId := sha1.Sum([]byte(uniuri.New()))
 
-	// Write protocol string
-	data = append(data, []byte("BitTorrent protocol")...)
-	for i := 0; i < 8; i++ {
-		data = append(data, byte(0))
-	}
+	message := make([]byte, 0)
+	message = append(message, 19)
+	message = append(message, []byte("BitTorrent protocol")...)
+	message = append(message, []byte{0, 0, 0, 0, 0, 16, 0, 0}...)
+	message = append(message, infoHash[:]...)
+	message = append(message, peerId[:]...)
 
-	// Write hash
-	data = append(data, infoHash...)
+	conn.Write(message)
 
-	// Write peer id
-	peerId := make([]byte, 0)
-	for i := 0; i < 20; i++ {
-		peerId = append(peerId, byte(1))
-	}
-	data = append(data, peerId...)
-	return data, nil
+	res := make([]byte, 68)
+	conn.Read(res)
+
+	return res
 }
 
-func StartPeerConnectionNaive(torrentInfo map[string]interface{}, peerIp string, piecesChannel chan int, freePeer chan string) error {
-	info, _ := ReadInfo(torrentInfo)
-	for {
-		pieceIndex, ok := <-piecesChannel
-		if !ok {
-			log.Println("piece channel not ok")
-			break
-		}
-		//log.Printf("piece Id: %s got for peer Ip %s", strconv.Itoa(pieceIndex), peerIp)
+func performExtensionHandshake(conn net.Conn) PeerResponse {
+	payload := make(map[string]any)
+	payload["m"] = map[string]int{
+		"ut_metadata": 15,
+	}
 
-		piece, err := DownloadPieceWithPeerIp(torrentInfo, pieceIndex, peerIp)
+	var buffer bytes.Buffer
+	bencode.Marshal(io.Writer(&buffer), payload)
+
+	message := make([]byte, 4)
+	binary.BigEndian.PutUint32(message[0:4], uint32(2+len(buffer.Bytes())))
+	message = append(message, 20) // id
+	message = append(message, 0)  // payload id
+	message = append(message, buffer.Bytes()...)
+
+	conn.Write(message)
+
+	res, err := readMessage(conn, 20)
+	if err != nil {
+		panic(err)
+	}
+
+	return res
+}
+
+func readMessage(conn net.Conn, expectedId uint) (PeerResponse, error) {
+	res := make([]byte, 5)
+	_, err := io.ReadFull(conn, res)
+	if err != nil {
+		return PeerResponse{}, err
+	}
+
+	msgLength := binary.BigEndian.Uint32(res[:5])
+
+	payload := make([]byte, msgLength-1)
+	_, err = io.ReadFull(conn, payload)
+	if err != nil {
+		return PeerResponse{}, err
+	}
+
+	receivedId := uint(res[4])
+	if expectedId != receivedId {
+		return PeerResponse{}, fmt.Errorf("expected id %d, but reveived %d", expectedId, receivedId)
+	}
+
+	return PeerResponse{
+		length:  int(binary.BigEndian.Uint32(res[:5])),
+		id:      int(res[4]),
+		payload: payload,
+	}, nil
+}
+
+func resolvePieceResonse(msg *PeerResponse) PieceResponse {
+	index := int(binary.BigEndian.Uint32(msg.payload[:4]))
+	begin := int(binary.BigEndian.Uint32(msg.payload[4:8]))
+	data := msg.payload[8:]
+
+	return PieceResponse{
+		index: index,
+		begin: begin,
+		data:  data,
+	}
+}
+
+func resolveMetadataExtensionId(msg *PeerResponse) int {
+	decoded, _, _ := decodeDict(string(msg.payload[1:]))
+
+	m := decoded["m"].(map[string]interface{})
+	return m["ut_metadata"].(int)
+}
+
+func downloadWorker(conn net.Conn, torrentFile *TorrentFile, pieceIdx <-chan int, fileData *[]byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for idx := range pieceIdx {
+		indexPieceLength := min(torrentFile.info.length-idx*torrentFile.info.pieceLength, torrentFile.info.pieceLength)
+		pieceData := downloadPiece(conn, indexPieceLength, idx)
+
+		copy((*fileData)[idx*torrentFile.info.pieceLength:], pieceData)
+	}
+}
+
+func initConnection(peer string, infoHash [20]byte) net.Conn {
+	conn, err := net.Dial("tcp", peer)
+	if err != nil {
+		panic(fmt.Sprintln("dial error:", err))
+	}
+
+	performHandshake(conn, infoHash)
+
+	_, err = readMessage(conn, 5)
+	if err != nil {
+		panic(err)
+	}
+
+	sendInterestedMessage(conn)
+
+	return conn
+}
+
+func sendInterestedMessage(conn net.Conn) {
+	// interested message; length = id (1 byte)
+	message := []byte{0, 0, 0, 1, 2}
+	conn.Write(message)
+
+	_, err := readMessage(conn, 1)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func initMagnetConn(magnetUrl string) (net.Conn, [20]byte, int) {
+	magnetLink := parseMagnetLink(magnetUrl)
+	torrentFile := TorrentFile{
+		announce: magnetLink.trackerUrl,
+		info: Info{
+			length:      999,
+			pieceLength: 0,
+			pieces:      make([][20]byte, 0),
+			infoHash:    magnetLink.infoHash,
+		}}
+
+	peers := resolvePeers(&torrentFile)
+
+	conn, err := net.Dial("tcp", peers[0])
+	if err != nil {
+		panic(fmt.Sprintln("dial error:", err))
+	}
+	baseRes := performHandshake(conn, magnetLink.infoHash)
+
+	// read bitfield msg
+	_, err = readMessage(conn, 5)
+	if err != nil {
+		panic(err)
+	}
+
+	extensionId := 0
+	if baseRes[25] == 16 { // supports extensions
+		extensionRes := performExtensionHandshake(conn)
+		extensionId = resolveMetadataExtensionId(&extensionRes)
+	}
+
+	var peerId [20]byte
+	copy(peerId[:], baseRes[len(baseRes)-20:])
+	return conn, peerId, extensionId
+}
+
+func requestExtensionMetadata(conn net.Conn, metadataExtensionId int) ExtensionMetadata {
+	payload := map[string]int{
+		"msg_type": 0,
+		"piece":    0,
+	}
+
+	var buffer bytes.Buffer
+	bencode.Marshal(io.Writer(&buffer), payload)
+
+	message := make([]byte, 4)
+	binary.BigEndian.PutUint32(message[0:4], uint32(2+len(buffer.Bytes())))
+	message = append(message, 20)                        // id
+	message = append(message, byte(metadataExtensionId)) // extension peer id
+	message = append(message, buffer.Bytes()...)
+
+	conn.Write(message)
+
+	res, err := readMessage(conn, 20)
+	if err != nil {
+		panic(err)
+	}
+
+	_, rest, _ := decodeDict(string(res.payload[1:]))
+	decodedMetadata, _, _ := decodeDict(rest)
+
+	return ExtensionMetadata{
+		length:      decodedMetadata["length"].(int),
+		pieceLength: decodedMetadata["piece length"].(int),
+		name:        decodedMetadata["name"].(string),
+		pieces:      formatPiecesString(decodedMetadata["pieces"].(string)),
+	}
+}
+
+func downloadPiece(conn net.Conn, pieceLength int, pieceIdx int) []byte {
+	// send block requests
+	pieceData := make([]byte, 0)
+	blockCount := math.Ceil(float64(pieceLength) / float64(BLOCK_SIZE))
+	for i := 0; i < int(blockCount); i += 1 {
+		blockLength := min(pieceLength-i*BLOCK_SIZE, BLOCK_SIZE)
+
+		payload := make([]byte, 12)
+		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceIdx))
+		binary.BigEndian.PutUint32(payload[4:8], uint32(i*BLOCK_SIZE))
+		binary.BigEndian.PutUint32(payload[8:], uint32(blockLength))
+
+		// length = id (1 byte) + payload (3*4 bytes)
+		message := []byte{0, 0, 0, 13, 6}
+		message = append(message, payload...)
+
+		conn.Write(message)
+
+		res, err := readMessage(conn, 7)
 		if err != nil {
-			log.Print("error dll piece")
-			return err
+			fmt.Println(err)
+			return []byte{}
 		}
-
-		//log.Println("verify piece")
-		sum := sha1.Sum(piece)
-		pieces := GetPiecesHash(info)
-		if string(sum[:]) != pieces[pieceIndex] {
-			log.Fatalf("hash not matching")
-		} else {
-			pieces_lock.Lock()
-			pieces_map[pieceIndex] = piece
-			pieces_lock.Unlock()
-			log.Println(peerIp + " is free")
-			freePeer <- peerIp
-		}
+		piece := resolvePieceResonse(&res)
+		pieceData = slices.Insert(pieceData, piece.begin, piece.data...)
 	}
-	return nil
+
+	return pieceData
 }
 
-func StartPeerConnectionNaiveForMagnet(torrentInfo magnet.MagnetInfo, peerIp string, piecesChannel chan int, freePeer chan string) error {
-	for {
-		pieceIndex, ok := <-piecesChannel
-		if !ok {
-			log.Println("piece channel not ok")
-			break
-		}
-		//log.Printf("piece Id: %s got for peer Ip %s", strconv.Itoa(pieceIndex), peerIp)
+func parseMagnetLink(link string) MagnetLink {
+	u, _ := url.Parse(link)
+	query, _ := url.ParseQuery(u.RawQuery)
 
-		piece, err := DownloadPieceWithPeerIpForMagnet(torrentInfo, pieceIndex, peerIp)
-		if err != nil {
-			log.Print("error dll piece")
-			return err
-		}
+	trackerUrl := query.Get("tr")
+	xt := query.Get("xt")
+	infoHashHex := strings.Split(xt, ":")[2]
 
-		//log.Println("verify piece")
-		sum := sha1.Sum(piece)
-		pieces := torrentInfo.Pieces
-		if string(sum[:]) != pieces[pieceIndex] {
-			log.Fatalf("hash not matching")
-		} else {
-			pieces_lock.Lock()
-			pieces_map[pieceIndex] = piece
-			pieces_lock.Unlock()
-			log.Println(peerIp + " is free")
-			freePeer <- peerIp
-		}
+	decodedHash, _ := hex.DecodeString(infoHashHex)
+	var infoHash [20]byte
+	copy(infoHash[:], decodedHash)
+
+	return MagnetLink{
+		trackerUrl:  trackerUrl,
+		infoHashHex: infoHashHex,
+		infoHash:    infoHash,
 	}
-	return nil
-}
-
-func DownloadFile(torrentInfo map[string]interface{}) ([]byte, error) {
-	pieces_map = make(map[int][]byte)
-	pieces_lock = sync.Mutex{}
-
-	info, _ := ReadInfo(torrentInfo)
-	peers, err := DiscoverPeers(bencode.ConvToString(torrentInfo["announce"]), HashInfo(info), info["length"].(int))
-	if err != nil {
-		return nil, err
-	}
-
-	numPieces := len(GetPiecesHash(info))
-	piecesQueue := make([]int, numPieces)
-	for i := 0; i < numPieces; i++ {
-		piecesQueue[i] = i
-	}
-
-	freePeers := peers
-	freePeerChan := make(chan string)
-	peerToChan := make(map[string]chan int)
-	for i := 0; i < len(peers); i++ {
-		peerChan := make(chan int)
-		peerToChan[peers[i]] = peerChan
-		log.Println("starting peer conn " + peers[i])
-		go StartPeerConnectionNaive(torrentInfo, peers[i], peerChan, freePeerChan)
-	}
-
-	for len(piecesQueue) > 0 {
-		pieceId := piecesQueue[0]
-		if len(freePeers) > 0 {
-			peer := freePeers[0]
-			freePeers = freePeers[1:]
-			log.Println("requesting piece " + strconv.Itoa(pieceId))
-			peerToChan[peer] <- pieceId
-			piecesQueue = piecesQueue[1:]
-		} else {
-			//log.Println("waiting for free peer to send piece to " + strconv.Itoa(pieceId))
-			peer := <-freePeerChan
-			freePeers = append(freePeers, peer)
-		}
-		//
-	}
-
-	for len(pieces_map) < numPieces {
-	}
-
-	log.Println("closing peer channels")
-	for _, chann := range peerToChan {
-		close(chann)
-	}
-	log.Printf("pieces map size: %s", strconv.Itoa(len(pieces_map)))
-	log.Println("closing free peer channels")
-	//close(freePeerChan)
-
-	file := make([]byte, 0)
-	for i := 0; i < len(pieces_map); i++ {
-		file = append(file, pieces_map[i]...)
-	}
-	return file, nil
-}
-
-func DownloadFileForMagnet(torrentInfo magnet.MagnetInfo) ([]byte, error) {
-	pieces_map = make(map[int][]byte)
-	pieces_lock = sync.Mutex{}
-
-	numPieces := len(torrentInfo.Pieces)
-	piecesQueue := make([]int, numPieces)
-	for i := 0; i < numPieces; i++ {
-		piecesQueue[i] = i
-	}
-
-	freePeers := torrentInfo.PeerIps
-	freePeerChan := make(chan string)
-	peerToChan := make(map[string]chan int)
-	for i := 0; i < len(torrentInfo.PeerIps); i++ {
-		peerChan := make(chan int)
-		peerToChan[torrentInfo.PeerIps[i]] = peerChan
-		log.Println("starting peer conn " + torrentInfo.PeerIps[i])
-		go StartPeerConnectionNaiveForMagnet(torrentInfo, torrentInfo.PeerIps[i], peerChan, freePeerChan)
-	}
-
-	for len(piecesQueue) > 0 {
-		pieceId := piecesQueue[0]
-		if len(freePeers) > 0 {
-			peer := freePeers[0]
-			freePeers = freePeers[1:]
-			log.Println("requesting piece " + strconv.Itoa(pieceId))
-			peerToChan[peer] <- pieceId
-			piecesQueue = piecesQueue[1:]
-		} else {
-			//log.Println("waiting for free peer to send piece to " + strconv.Itoa(pieceId))
-			peer := <-freePeerChan
-			freePeers = append(freePeers, peer)
-		}
-		//
-	}
-
-	for len(pieces_map) < numPieces {
-	}
-
-	log.Println("closing peer channels")
-	for _, chann := range peerToChan {
-		close(chann)
-	}
-	log.Printf("pieces map size: %s", strconv.Itoa(len(pieces_map)))
-	log.Println("closing free peer channels")
-	//close(freePeerChan)
-
-	file := make([]byte, 0)
-	for i := 0; i < len(pieces_map); i++ {
-		file = append(file, pieces_map[i]...)
-	}
-	return file, nil
-}
-
-func DownloadPiece(torrentInfo map[string]interface{}, pieceIndex int) ([]byte, error) {
-	info, _ := ReadInfo(torrentInfo)
-	peers, err := DiscoverPeers(bencode.ConvToString(torrentInfo["announce"]), HashInfo(info), info["length"].(int))
-	if err != nil {
-		log.Fatalf("error discovering peers")
-		return nil, err
-	}
-
-	peerIp := peers[0]
-	return DownloadPieceWithPeerIp(torrentInfo, pieceIndex, peerIp)
-}
-
-func DownloadPieceWithPeerIpForMagnet(magInfo magnet.MagnetInfo, pieceIndex int, peerIp string) ([]byte, error) {
-	conn, err := utils.MakeConnection(peerIp)
-	if err != nil {
-		log.Fatalf("error with handshake")
-		return nil, err
-	}
-
-	hashBytes, _ := hex.DecodeString(magInfo.InfoHash)
-	handshake, err := GetHandshakeBytes(hashBytes)
-	if err != nil {
-		log.Fatalf("error with handshake")
-		return nil, err
-	}
-	conn.Write(handshake)
-
-	buf := make([]byte, 68)
-	_, err = conn.Read(buf)
-	if err != nil {
-		log.Fatalf("error read")
-		return nil, err
-	}
-
-	//peerId := buf[len(buf)-20:]
-	//log.Println("Peer ID: " + hex.EncodeToString(peerId))
-	//log.Println("waiting for bitfeld msg")
-	_, err = WaitForSpecificPeerMessage(conn, BITFIELD)
-	if err != nil {
-		log.Fatalf("error retrieving bitfield msg")
-		return nil, err
-	}
-
-	// Send interested msg
-	//log.Println("sending interested msg")
-	SendPeerMessage(conn, 2, make([]byte, 0))
-
-	// Wait for unchoke msg
-	//log.Println("waiting for unchoke msg")
-	_, err = WaitForSpecificPeerMessage(conn, UNCHOKE)
-	if err != nil {
-		log.Fatalf("error retrieving unchoke msg")
-		return nil, err
-	}
-	//log.Println("received unchoke msg")
-	piece_length := getPieceLength(pieceIndex, magInfo.PieceLength, magInfo.Length)
-	//log.Print("piece length: " + strconv.Itoa(piece_length))
-	piece_data := make([]byte, piece_length)
-	for beginOffset := 0; beginOffset < piece_length; beginOffset = beginOffset + BLOCK_LENGTH {
-		//log.Println("sending request msg with begin: " + strconv.Itoa(beginOffset))
-		var blockLength int
-		if (beginOffset + BLOCK_LENGTH) < piece_length {
-			blockLength = BLOCK_LENGTH
-		} else {
-			blockLength = piece_length - beginOffset
-		}
-
-		SendRequestMsg(conn, uint32(pieceIndex), uint32(beginOffset), uint32(blockLength))
-	}
-
-	for beginOffset := 0; beginOffset < piece_length; beginOffset = beginOffset + BLOCK_LENGTH {
-		//log.Println("waiting for download msg")
-		block, err := WaitForSpecificPeerMessage(conn, PIECE)
-		//log.Println("rcvd download msg")
-		if err != nil {
-			log.Fatalf("error piece msg")
-			return nil, err
-		}
-
-		rcvdPieceIndex := binary.BigEndian.Uint32(block[0:4])
-		if rcvdPieceIndex != uint32(pieceIndex) {
-			log.Fatalf("rcvd piece index different")
-			os.Exit(1)
-		}
-
-		begin := binary.BigEndian.Uint32(block[4:8])
-		for bi := 8; bi < len(block); bi++ {
-			piece_data[begin] = block[bi]
-			begin = begin + 1
-		}
-	}
-	//log.Println("verify piece")
-	sum := sha1.Sum(piece_data)
-	if string(sum[:]) != magInfo.Pieces[pieceIndex] {
-		log.Fatalf("piece hash incorrect")
-	}
-	defer conn.Close()
-	return piece_data, nil
-}
-
-func DownloadPieceWithPeerIp(torrentInfo map[string]any, pieceIndex int, peerIp string) ([]byte, error) {
-	info, err := ReadInfo(torrentInfo)
-	if err != nil {
-		log.Fatalf("Issue with info")
-		return nil, err
-	}
-
-	conn, err := utils.MakeConnection(peerIp)
-	if err != nil {
-		log.Fatalf("error with handshake")
-		return nil, err
-	}
-
-	hashBytes, _ := hex.DecodeString(HashInfo(info))
-	handshake, err := GetHandshakeBytes(hashBytes)
-	if err != nil {
-		log.Fatalf("error with handshake")
-		return nil, err
-	}
-	conn.Write(handshake)
-
-	buf := make([]byte, 68)
-	_, err = conn.Read(buf)
-	if err != nil {
-		log.Fatalf("error read")
-		return nil, err
-	}
-
-	//peerId := buf[len(buf)-20:]
-	//log.Println("Peer ID: " + hex.EncodeToString(peerId))
-	//log.Println("waiting for bitfeld msg")
-	_, err = WaitForSpecificPeerMessage(conn, BITFIELD)
-	if err != nil {
-		log.Fatalf("error retrieving bitfield msg")
-		return nil, err
-	}
-
-	// Send interested msg
-	//log.Println("sending interested msg")
-	SendPeerMessage(conn, 2, make([]byte, 0))
-
-	// Wait for unchoke msg
-	//log.Println("waiting for unchoke msg")
-	_, err = WaitForSpecificPeerMessage(conn, UNCHOKE)
-	if err != nil {
-		log.Fatalf("error retrieving unchoke msg")
-		return nil, err
-	}
-	//log.Println("received unchoke msg")
-	piece_length := getPieceLength(pieceIndex, info["piece length"].(int), info["length"].(int))
-	//log.Print("piece length: " + strconv.Itoa(piece_length))
-	piece_data := make([]byte, piece_length)
-	for beginOffset := 0; beginOffset < piece_length; beginOffset = beginOffset + BLOCK_LENGTH {
-		//log.Println("sending request msg with begin: " + strconv.Itoa(beginOffset))
-		var blockLength int
-		if (beginOffset + BLOCK_LENGTH) < piece_length {
-			blockLength = BLOCK_LENGTH
-		} else {
-			blockLength = piece_length - beginOffset
-		}
-
-		SendRequestMsg(conn, uint32(pieceIndex), uint32(beginOffset), uint32(blockLength))
-	}
-
-	for beginOffset := 0; beginOffset < piece_length; beginOffset = beginOffset + BLOCK_LENGTH {
-		//log.Println("waiting for download msg")
-		block, err := WaitForSpecificPeerMessage(conn, PIECE)
-		//log.Println("rcvd download msg")
-		if err != nil {
-			log.Fatalf("error piece msg")
-			return nil, err
-		}
-
-		rcvdPieceIndex := binary.BigEndian.Uint32(block[0:4])
-		if rcvdPieceIndex != uint32(pieceIndex) {
-			log.Fatalf("rcvd piece index different")
-			os.Exit(1)
-		}
-
-		begin := binary.BigEndian.Uint32(block[4:8])
-		for bi := 8; bi < len(block); bi++ {
-			piece_data[begin] = block[bi]
-			begin = begin + 1
-		}
-	}
-	//log.Println("verify piece")
-	sum := sha1.Sum(piece_data)
-	pieces := GetPiecesHash(info)
-	if string(sum[:]) != pieces[pieceIndex] {
-		log.Fatalf("piece hash incorrect")
-	}
-	defer conn.Close()
-	return piece_data, nil
-}
-
-func GetMagnetInfo(magnetLink string) (magnet.MagnetInfo, error) {
-	magInfo := magnet.MagnetInfo{}
-	parsed, err := magnet.ParseMagnetLink(magnetLink)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	log.Println("parsed magnet link")
-	trackerUrl, err := magnet.GetTrackerUrl(parsed)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-
-	infoHash, err := magnet.GetInfoHash(parsed)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-
-	peers, err := magnet.DiscoverPeers(trackerUrl, infoHash)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-	log.Println("discovered peers")
-	peerIp := peers[0]
-	conn, err := utils.MakeConnection(peerIp)
-	if err != nil {
-		fmt.Println("error with making connection")
-		return magInfo, err
-	}
-
-	hashBytes, _ := hex.DecodeString(infoHash)
-	handshake, err := magnet.GetHandshakeBytesForMagnet(hashBytes)
-	if err != nil {
-		log.Print("error with handshake")
-		return magInfo, err
-	}
-	conn.Write(handshake)
-
-	buf := make([]byte, 68)
-	_, err = conn.Read(buf)
-	if err != nil {
-		log.Print("error read")
-		return magInfo, err
-	}
-
-	peerId := buf[len(buf)-20:]
-	// TODO: send & receive bitfeld msg
-	log.Println("rcving bitfield msg")
-	_, err = WaitForSpecificPeerMessage(conn, BITFIELD)
-	if err != nil {
-		log.Print("error rcv bitfield")
-		return magInfo, err
-	}
-
-	magnetBytes, err := magnet.GetHandshakeBytesForMagnetExtension2()
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-	if buf[25] == 16 {
-		log.Println("sending extension handshake")
-		conn.Write(magnetBytes)
-	}
-
-	log.Println("start receiving magnet extension handshake")
-	msgLength := make([]byte, 4)
-	_, err = conn.Read(msgLength)
-	if err != nil {
-		log.Print("error reading msglength")
-		return magInfo, err
-	}
-	msgLengthInt := binary.BigEndian.Uint32(msgLength)
-	log.Println("length: " + strconv.Itoa(int(msgLengthInt)))
-	magPayload := make([]byte, msgLengthInt)
-	_, err = io.ReadFull(conn, magPayload)
-	if err != nil {
-		log.Print("error reading payload")
-		return magInfo, err
-	}
-	defer conn.Close()
-	log.Print("magM: " + strconv.Itoa(len(magPayload)))
-	magM, _, err := bencode.DecodeBencode(string(magPayload[2:]), 0)
-	magMMap := magM.(map[string]any)
-	if err != nil {
-		log.Print("error decoding")
-		return magInfo, err
-	}
-	m := magMMap["m"].(map[string]any)
-	magPeer := bencode.ConvToString(m["ut_metadata"])
-
-	magReqMsgMap := magM.(map[string]any)
-	magReqMsgMap["msg_type"] = 0
-	magReqMsgMap["piece"] = 0
-
-	magReqMsgMapEncoded, err := bencode.DictToBencode(magReqMsgMap)
-	if err != nil {
-		log.Print("error encoding")
-		return magInfo, err
-	}
-
-	peerExtId, err := strconv.Atoi(magPeer)
-	if err != nil {
-		log.Print("peerid failure " + hex.EncodeToString(peerId))
-		return magInfo, err
-	}
-
-	magnet.SendExtensionMessage(conn, peerExtId, []byte(magReqMsgMapEncoded))
-
-	reqMsg, err := WaitForSpecificExtensionMsg(conn, 20)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-
-	//extensionMsgId := reqMsg[0]
-	_, index, err := bencode.DecodeBencode(string(reqMsg[1:]), 0)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-	extMsg, _, err := bencode.DecodeBencode(string(reqMsg[1+index:]), 0)
-	if err != nil {
-		log.Print(err.Error())
-		return magInfo, err
-	}
-	extMsgM := extMsg.(map[string]any)
-
-	magInfo.InfoHash = infoHash
-	magInfo.PeerIps = peers
-	magInfo.PieceLength, _ = strconv.Atoi(bencode.ConvToString(extMsgM["piece length"]))
-	magInfo.Length, _ = strconv.Atoi(bencode.ConvToString(extMsgM["length"]))
-	magInfo.Pieces = GetPiecesHash(extMsgM)
-	magInfo.TrackerUrl = trackerUrl
-
-	return magInfo, nil
 }
 
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
-
 	command := os.Args[1]
 
 	if command == "decode" {
 		bencodedValue := os.Args[2]
-		jsonOutput, _ := bencode.DecodeBencodeToString(bencodedValue)
-		fmt.Println(jsonOutput)
+
+		decoded, _, err := decodeBencode(bencodedValue)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		jsonOutput, _ := json.Marshal(decoded)
+		fmt.Println(string(jsonOutput))
 	} else if command == "info" {
-		filePath := os.Args[2]
-		info, err := DecodeInfo(filePath)
-		if err != nil {
-			log.Fatalf("Issue with info")
-			os.Exit(1)
+		fileName := os.Args[2]
+
+		torrentFile := decodeTorrentFile(fileName)
+
+		fmt.Println("Tracker URL:", torrentFile.announce)
+		fmt.Println("Length:", torrentFile.info.length)
+		fmt.Printf("Info Hash: %x\n", torrentFile.info.infoHash)
+		fmt.Println("Piece Length:", torrentFile.info.pieceLength)
+		fmt.Println("Piece Hashes:")
+		for _, hash := range torrentFile.info.pieces {
+			fmt.Printf("%x\n", hash)
 		}
-		fmt.Println(info)
 	} else if command == "peers" {
-		filePath := os.Args[2]
-		m, err := ReadTorrent(filePath)
-		if err != nil {
-			log.Fatalf("Issue with m")
-			os.Exit(1)
-		}
-		info, err := ReadInfo(m)
-		if err != nil {
-			log.Fatalf("Issue with info")
-			os.Exit(1)
+		fileName := os.Args[2]
+		torrentFile := decodeTorrentFile(fileName)
+
+		peers := resolvePeers(&torrentFile)
+		for _, peer := range peers {
+			fmt.Println(peer)
 		}
 
-		ans, err := DiscoverPeers(bencode.ConvToString(m["announce"]), HashInfo(info), info["length"].(int))
-		if err != nil {
-			log.Fatalf("Issue with peer")
-			os.Exit(1)
-		}
-		strAns := strings.Join(ans, "\n")
-		fmt.Println(strAns)
 	} else if command == "handshake" {
-		filePath := os.Args[2]
-		m, err := ReadTorrent(filePath)
-		if err != nil {
-			log.Fatalf("Issue with m")
-			os.Exit(1)
-		}
-		info, err := ReadInfo(m)
-		if err != nil {
-			log.Fatalf("Issue with info")
-			os.Exit(1)
-		}
+		fileName := os.Args[2]
+		peerAddr := os.Args[3]
 
-		peerIp := os.Args[3]
-		conn, err := utils.MakeConnection(peerIp)
-		if err != nil {
-			fmt.Println("error with handshake")
-			os.Exit(1)
-		}
+		torrentFile := decodeTorrentFile(fileName)
 
-		hashBytes, _ := hex.DecodeString(HashInfo(info))
-		handshake, err := GetHandshakeBytes(hashBytes)
+		conn, err := net.Dial("tcp", peerAddr)
 		if err != nil {
-			log.Fatalf("error with handshake")
-			os.Exit(1)
+			fmt.Println("dial error:", err)
+			return
 		}
-		conn.Write(handshake)
+		defer conn.Close()
 
-		buf := make([]byte, 68)
-		_, err = conn.Read(buf)
-		if err != nil {
-			log.Fatalf("error read")
-			os.Exit(1)
-		}
+		res := performHandshake(conn, torrentFile.info.infoHash)
 
-		peerId := buf[len(buf)-20:]
-		fmt.Println("Peer ID: " + hex.EncodeToString(peerId))
+		fmt.Printf("Peer ID: %x\n", res[len(res)-20:])
+
 	} else if command == "download_piece" {
-		downPath := os.Args[3]
-		filePath := os.Args[4]
-		pieceIndex, err := strconv.Atoi(os.Args[5])
-		if err != nil {
-			log.Fatal("issue decoding args")
-		}
+		outPath := os.Args[3]
+		fileName := os.Args[4]
+		index, _ := strconv.Atoi(os.Args[5])
 
-		torrentInfo, err := ReadTorrent(filePath)
-		if err != nil {
-			log.Fatal("issue reading torrent info")
-		}
-		piece_data, err := DownloadPiece(torrentInfo, pieceIndex)
-		if err != nil {
-			log.Fatal("issue downloading piece")
-		}
-		log.Println("writing to file")
-		os.WriteFile(downPath, piece_data, 0644)
+		torrentFile := decodeTorrentFile(fileName)
+		peers := resolvePeers(&torrentFile)
+
+		conn := initConnection(peers[0], torrentFile.info.infoHash)
+
+		indexPieceLength := min(torrentFile.info.length-index*torrentFile.info.pieceLength, torrentFile.info.pieceLength)
+		pieceData := downloadPiece(conn, indexPieceLength, index)
+
+		piece_hash := sha1.Sum(pieceData)
+
+		fmt.Printf("%x\n", piece_hash)
+		fmt.Printf("%x\n", torrentFile.info.pieces[index])
+
+		os.WriteFile(outPath, pieceData, 0644)
+
 	} else if command == "download" {
-		downPath := os.Args[3]
-		filePath := os.Args[4]
-		torrentInfo, err := ReadTorrent(filePath)
-		if err != nil {
-			log.Fatal("issue reading torrent info")
+		outPath := os.Args[3]
+		fileName := os.Args[4]
+
+		torrentFile := decodeTorrentFile(fileName)
+		peers := resolvePeers(&torrentFile)
+
+		conns := make([]net.Conn, 0)
+		for _, peer := range peers {
+			conns = append(conns, initConnection(peer, torrentFile.info.infoHash))
 		}
-		file, err := DownloadFile(torrentInfo)
-		if err != nil {
-			log.Fatalf("issue with dll")
+
+		jobs := make(chan int, len(torrentFile.info.pieces))
+		fileData := make([]byte, torrentFile.info.length)
+
+		var wg sync.WaitGroup
+		for _, conn := range conns {
+			wg.Add(1)
+			go downloadWorker(conn, &torrentFile, jobs, &fileData, &wg)
 		}
-		log.Println("writing to file")
-		os.WriteFile(downPath, file, 0644)
+
+		for idx := range torrentFile.info.pieces {
+			jobs <- idx
+		}
+		close(jobs)
+		wg.Wait()
+
+		os.WriteFile(outPath, fileData, 0644)
+
 	} else if command == "magnet_parse" {
-		parsed, err := magnet.ParseMagnetLink(os.Args[2])
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		magHash, err := magnet.GetInfoHash(parsed)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
+		magnetUrl := os.Args[2]
 
-		trackerUrl, err := magnet.GetTrackerUrl(parsed)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		op := "Tracker URL: " + trackerUrl + "\nInfo Hash: " + magHash
-		fmt.Println(op)
+		magnetLink := parseMagnetLink(magnetUrl)
+
+		fmt.Printf("Tracker URL: %s\n", magnetLink.trackerUrl)
+		fmt.Printf("Info Hash: %s\n", magnetLink.infoHashHex)
+
 	} else if command == "magnet_handshake" {
-		magnetLink := os.Args[2]
-		parsed, err := magnet.ParseMagnetLink(magnetLink)
-		if err != nil {
-			log.Fatal(err.Error())
+		magnetUrl := os.Args[2]
+
+		_, peerId, extensionId := initMagnetConn(magnetUrl)
+
+		fmt.Printf("Peer ID: %x\n", peerId)
+		if extensionId != 0 {
+			fmt.Printf("Peer Metadata Extension ID: %d\n", extensionId)
 		}
 
-		log.Println("parsed magnet link")
-		trackerUrl, err := magnet.GetTrackerUrl(parsed)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-
-		infoHash, err := magnet.GetInfoHash(parsed)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-
-		peers, err := magnet.DiscoverPeers(trackerUrl, infoHash)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		log.Println("discovered peers")
-		peerIp := peers[0]
-		conn, err := utils.MakeConnection(peerIp)
-		if err != nil {
-			fmt.Println("error with making connection")
-			os.Exit(1)
-		}
-
-		hashBytes, _ := hex.DecodeString(infoHash)
-		handshake, err := magnet.GetHandshakeBytesForMagnet(hashBytes)
-		if err != nil {
-			log.Fatalf("error with handshake")
-			os.Exit(1)
-		}
-		conn.Write(handshake)
-
-		buf := make([]byte, 68)
-		_, err = conn.Read(buf)
-		if err != nil {
-			log.Fatalf("error read")
-			os.Exit(1)
-		}
-
-		peerId := buf[len(buf)-20:]
-		// TODO: send & receive bitfeld msg
-		log.Println("rcving bitfield msg")
-		_, err = WaitForSpecificPeerMessage(conn, BITFIELD)
-		if err != nil {
-			log.Fatal("error rcv bitfield")
-		}
-
-		magnetBytes, err := magnet.GetHandshakeBytesForMagnetExtension2()
-		if err != nil {
-			log.Fatal(err.Error())
-			os.Exit(1)
-		}
-		if buf[25] == 16 {
-			log.Println("sending extension handshake")
-			conn.Write(magnetBytes)
-		}
-
-		log.Println("start receiving magnet extension handshake")
-		msgLength := make([]byte, 4)
-		_, err = conn.Read(msgLength)
-		if err != nil {
-			log.Fatal("error reading msglength")
-		}
-		msgLengthInt := binary.BigEndian.Uint32(msgLength)
-		log.Println("length: " + strconv.Itoa(int(msgLengthInt)))
-		magPayload := make([]byte, msgLengthInt)
-		_, err = io.ReadFull(conn, magPayload)
-		if err != nil {
-			log.Fatal("error reading payload")
-		}
-		log.Print("magM: " + strconv.Itoa(len(magPayload)))
-		magM, _, err := bencode.DecodeBencode(string(magPayload[2:]), 0)
-		magMMap := magM.(map[string]any)
-		if err != nil {
-			log.Fatal("error decoding")
-		}
-		m := magMMap["m"].(map[string]any)
-		magPeer := bencode.ConvToString(m["ut_metadata"])
-		fmt.Println("Peer ID: " + hex.EncodeToString(peerId))
-		fmt.Println("Peer Metadata Extension ID: " + magPeer)
 	} else if command == "magnet_info" {
-		magnetLink := os.Args[2]
-		magInfo, err := GetMagnetInfo(magnetLink)
-		piecesS := ""
-		for _, v := range magInfo.Pieces {
-			piecesS = piecesS + "\n" + hex.EncodeToString([]byte(v))
-		}
-		op := "Tracker URL: " + magInfo.TrackerUrl
-		op = op + "\nLength: " + strconv.Itoa(magInfo.Length)
-		op = op + "\nInfo Hash: " + magInfo.InfoHash
-		op = op + "\nPiece Length: " + strconv.Itoa(magInfo.PieceLength)
-		op = op + "\nPiece Hashes: " + piecesS
+		magnetUrl := os.Args[2]
+		magnetLink := parseMagnetLink(magnetUrl)
 
-		if err != nil {
-			log.Fatal(err.Error())
+		conn, _, extensionId := initMagnetConn(magnetUrl)
+		metadata := requestExtensionMetadata(conn, extensionId)
+
+		fmt.Printf("Tracker URL: %s\n", magnetLink.trackerUrl)
+		fmt.Printf("Length: %d\n", metadata.length)
+		fmt.Printf("Info Hash: %s\n", magnetLink.infoHashHex)
+		fmt.Printf("Piece Length: %d\n", metadata.pieceLength)
+		fmt.Println("Piece Hashes:")
+		for _, hash := range metadata.pieces {
+			fmt.Printf("%x\n", hash)
 		}
-		fmt.Print(op)
+
 	} else if command == "magnet_download_piece" {
-		path := os.Args[3]
-		magnetLink := os.Args[4]
-		pieceIndex := os.Args[5]
-		magInfo, err := GetMagnetInfo(magnetLink)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		pieceIndexInt, err := strconv.Atoi(pieceIndex)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		data, err := DownloadPieceWithPeerIpForMagnet(magInfo, pieceIndexInt, magInfo.PeerIps[0])
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		os.WriteFile(path, data, 0644)
-	} else if command == "magnet_download" {
-		path := os.Args[3]
-		magnetLink := os.Args[4]
-		torrentInfo, err := GetMagnetInfo(magnetLink)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
+		outPath := os.Args[3]
+		magnetUrl := os.Args[4]
+		index, _ := strconv.Atoi(os.Args[5])
 
-		data, err := DownloadFileForMagnet(torrentInfo)
+		conn, _, extensionId := initMagnetConn(magnetUrl)
+		metadata := requestExtensionMetadata(conn, extensionId)
 
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		os.WriteFile(path, data, 0644)
+		sendInterestedMessage(conn)
+
+		indexPieceLength := min(metadata.length-index*metadata.pieceLength, metadata.pieceLength)
+		pieceData := downloadPiece(conn, indexPieceLength, index)
+
+		piece_hash := sha1.Sum(pieceData)
+
+		fmt.Printf("%x\n", piece_hash)
+		fmt.Printf("%x\n", metadata.pieces[index])
+
+		os.WriteFile(outPath, pieceData, 0644)
+
 	} else {
-		log.Fatalf("Unknown command: %s", command)
+		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
 	}
 }
