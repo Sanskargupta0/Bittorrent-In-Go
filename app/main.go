@@ -1,211 +1,178 @@
 package main
 
 import (
-	// Uncomment this line to pass the first stage
-	// "encoding/json"
+	"bytes"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
+	"strconv"
+	"unicode"
+
+	bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
 
-func decode(b string, st int) (x interface{}, i int, err error) {
-	if st == len(b) {
-		return nil, st, io.ErrUnexpectedEOF
-	}
+// Ensures gofmt doesn't remove the "os" encoding/json import (feel free to remove this!)
+var _ = json.Marshal
 
-	i = st
-
-	switch {
-	case b[i] == 'l':
-		return decodeList(b, i)
-	case b[i] == 'd':
-		return decodeDict(b, i)
-	case b[i] == 'i':
-		return decodeInt(b, i)
-	case b[i] >= '0' && b[i] <= '9':
-		return decodeString(b, i)
-	default:
-		return nil, st, fmt.Errorf("unexpected value: %q", b[i])
-	}
-}
-
-func decodeString(b string, st int) (x string, i int, err error) {
-	var l int
-
-	i = st
-
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-		l = l*10 + (int(b[i]) - '0')
-		i++
-	}
-
-	if i == len(b) || b[i] != ':' {
-		return "", st, fmt.Errorf("bad string")
-	}
-
-	i++
-
-	if i+l > len(b) {
-		return "", st, fmt.Errorf("bad string: out of bounds")
-	}
-
-	x = b[i : i+l]
-	i += l
-
-	return x, i, nil
-}
-
-func decodeInt(b string, st int) (x int, i int, err error) {
-	i = st
-	i++ // 'i'
-
-	if i == len(b) {
-		return 0, st, fmt.Errorf("bad int")
-	}
-
-	neg := false
-
-	if b[i] == '-' {
-		neg = true
-		i++
-	}
-
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-		x = x*10 + (int(b[i]) - '0')
-		i++
-	}
-
-	if i == len(b) || b[i] != 'e' {
-		return 0, st, fmt.Errorf("bad int")
-	}
-
-	i++
-
-	if neg {
-		x = -x
-	}
-
-	return x, i, nil
-}
-
-func decodeList(b string, st int) (l []interface{}, i int, err error) {
-	i = st
-	i++ // 'l'
-
-	l = make([]interface{}, 0)
-
-	for {
-		if i >= len(b) {
-			return nil, st, fmt.Errorf("bad list")
+// Example:
+// - 5:hello -> hello
+// - 10:hello12345 -> hello12345
+func decodeBencode(bencodedString string) (interface{}, error) {
+	var stk []interface{}
+	for i := 0; i < len(bencodedString); {
+		if bencodedString[i] == 'l' {
+			stk = append(stk, 'l')
+			i++
+		} else if bencodedString[i] == 'd' {
+			stk = append(stk, 'd')
+			i++
+		} else if bencodedString[i] == 'i' {
+			num, adv, err := decodeBencodeInt(bencodedString[i:])
+			if err != nil {
+				return "", err
+			}
+			stk = append(stk, num)
+			i += adv
+		} else if unicode.IsDigit(rune(bencodedString[i])) {
+			str, adv, err := decodeBencodeStr(bencodedString[i:])
+			if err != nil {
+				return "", err
+			}
+			stk = append(stk, str)
+			i += adv
+		} else if bencodedString[i] == 'e' {
+			listElem := []interface{}{}
+			for j := len(stk) - 1; j >= 0; j-- {
+				if stk[j] == 'l' {
+					reverseList(listElem)
+					stk = stk[:len(stk)-1]
+					stk = append(stk, listElem)
+					break
+				}
+				if stk[j] == 'd' {
+					reverseList(listElem)
+					stk = stk[:len(stk)-1]
+					dict := make(map[string]interface{})
+					for k := 0; k < len(listElem); k += 2 {
+						dict[listElem[k].(string)] = listElem[k+1]
+					}
+					stk = append(stk, dict)
+					break
+				}
+				listElem = append(listElem, stk[j])
+				stk = stk[:len(stk)-1]
+			}
+			i++
 		}
 
-		if b[i] == 'e' {
+	}
+	return stk[0], nil
+}
+
+func decodeBencodeInt(bencodedString string) (interface{}, int, error) {
+	for i := 0; i < len(bencodedString); i++ {
+		if bencodedString[i] == 'e' {
+			numStr := bencodedString[1:i]
+			num, err := strconv.Atoi(numStr)
+			if err != nil {
+				return "", 0, err
+			}
+			return num, len(numStr) + 2, nil
+		}
+	}
+	return "", 0, fmt.Errorf("i<number>e is not correctly formatted")
+}
+
+func decodeBencodeStr(bencodedString string) (interface{}, int, error) {
+	var firstColonIndex int
+
+	for i := 0; i < len(bencodedString); i++ {
+		if bencodedString[i] == ':' {
+			firstColonIndex = i
 			break
 		}
-
-		var x interface{}
-
-		x, i, err = decode(b, i)
-		if err != nil {
-			return nil, i, err
-		}
-
-		l = append(l, x)
 	}
 
-	return l, i, nil
+	lengthStr := bencodedString[:firstColonIndex]
+
+	length, err := strconv.Atoi(lengthStr)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], len(lengthStr) + 1 + length, nil
 }
 
-func decodeDict(b string, st int) (d map[string]interface{}, i int, err error) {
-	if st == len(b) {
-		return nil, st, io.ErrUnexpectedEOF
+func reverseList(s []interface{}) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
 	}
-	if b[st] != 'd' {
-		return nil, st, fmt.Errorf("dict expected")
-	}
-
-	i = st
-	i++ // 'd'
-
-	d = make(map[string]interface{})
-
-	for {
-		if i >= len(b) {
-			return nil, st, fmt.Errorf("bad list")
-		}
-
-		if b[i] == 'e' {
-			break
-		}
-
-		pairst := i
-
-		var key, val interface{}
-
-		key, i, err = decode(b, i)
-		if err != nil {
-			return nil, i, err
-		}
-
-		keys, ok := key.(string)
-		if !ok {
-			return nil, pairst, fmt.Errorf("dict key is not a string: %q", key)
-		}
-
-		val, i, err = decode(b, i)
-		if err != nil {
-			return nil, i, err
-		}
-
-		d[keys] = val
-	}
-
-	return d, i, nil
 }
 
 func main() {
+	// You can use print statements as follows for debugging, they'll be visible when running tests.
+	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
+
 	command := os.Args[1]
 
-	switch command {
-	case "decode":
-		x, _, err := decode(os.Args[2], 0)
+	if command == "decode" {
+		// Uncomment this block to pass the first stage
+		//
+		bencodedValue := os.Args[2]
+
+		decoded, err := decodeBencode(bencodedValue)
 		if err != nil {
-			fmt.Printf("error: %v\n", err)
-			os.Exit(1)
+			fmt.Println(err)
+			return
 		}
 
-		y, err := json.Marshal(x)
-		if err != nil {
-			fmt.Printf("error: encode to json%v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("%s\n", y)
-	case "info":
+		jsonOutput, _ := json.Marshal(decoded)
+		fmt.Println(string(jsonOutput))
+	} else if command == "info" {
 		data, err := os.ReadFile(os.Args[2])
 		if err != nil {
 			fmt.Printf("error: read file: %v\n", err)
 			os.Exit(1)
 		}
-
-		d, _, err := decodeDict(string(data), 0)
+		d, err := decodeBencode(string(data))
 		if err != nil {
-			fmt.Printf("error: %v\n", err)
+			fmt.Printf("error: decode bencode: %v\n", err)
 			os.Exit(1)
 		}
+		dict, ok := d.(map[string]interface{})
+		if !ok {
+			fmt.Println("Top-level bencode is not a dictionary")
+			return
+		}
 
-		fmt.Printf("Tracker URL: %v\n", d["announce"])
+		fmt.Printf("Tracker URL: %v\n", dict["announce"])
 
-		info, ok := d["info"].(map[string]interface{})
-		if info == nil || !ok {
+		info, ok := dict["info"].(map[string]interface{})
+		if !ok || info == nil {
 			fmt.Printf("No info section\n")
 			return
 		}
 
 		fmt.Printf("Length: %v\n", info["length"])
-	default:
+
+		var buf bytes.Buffer
+		err = bencode.Marshal(&buf, info)
+		if err != nil {
+			fmt.Print(err)
+		}
+		infoBytes := buf.Bytes()
+		infoHash := sha1.Sum(infoBytes)
+		fmt.Printf("Info Hash: %x\n", infoHash)
+
+		fmt.Printf("Piece Length: %v\n", info["piece length"])
+
+		fmt.Printf("Piece Hashes:\n")
+		pieces, _ := info["pieces"].(string)
+		for i := 0; i < len(pieces); i += 20 {
+			fmt.Printf("%02x\n", pieces[i:i+20])
+		}
+	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
 	}
